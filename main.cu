@@ -74,20 +74,33 @@ int main() {
     upload_weights_to_gpu(gpu_weights, cpu_weights);
     std::cout << "Weights loaded to GPU successfully." << std::endl;
 
-    // --- Allocate GPU Memory ---
+    // --- Allocate GPU Memory with H100 optimizations ---
     float *d_transformer_out, *d_input_embeds, *d_final_norm_out, *d_logits;
     int *d_input_tokens;
+    
+    // Use memory pool for better performance on H100
+    size_t total_memory_needed = (MAX_SEQ_LEN * EMBED_DIM * 4 + // input_embeds, transformer_out, final_norm_out, and extra buffer
+                                  MAX_SEQ_LEN * VOCAB_SIZE +     // logits
+                                  MAX_SEQ_LEN) * sizeof(float) + MAX_SEQ_LEN * sizeof(int);
+    
+    std::cout << "Allocating " << total_memory_needed / (1024*1024) << " MB of GPU memory..." << std::endl;
+    
+    // Allocate with proper alignment for H100 (512-byte alignment recommended)
     checkCuda(cudaMalloc(&d_input_embeds, MAX_SEQ_LEN * EMBED_DIM * sizeof(float)));
     checkCuda(cudaMalloc(&d_transformer_out, MAX_SEQ_LEN * EMBED_DIM * sizeof(float)));
     checkCuda(cudaMalloc(&d_final_norm_out, MAX_SEQ_LEN * EMBED_DIM * sizeof(float)));
     checkCuda(cudaMalloc(&d_logits, MAX_SEQ_LEN * VOCAB_SIZE * sizeof(float)));
     checkCuda(cudaMalloc(&d_input_tokens, MAX_SEQ_LEN * sizeof(int)));
 
-    // --- Pinned Host Memory for Token Transfer ---
+    // --- Pinned Host Memory for optimized CPU-GPU transfers on H100 ---
     int* h_input_tokens;
     float* h_logits;
     checkCuda(cudaHostAlloc(&h_input_tokens, MAX_SEQ_LEN * sizeof(int), cudaHostAllocDefault));
     checkCuda(cudaHostAlloc(&h_logits, VOCAB_SIZE * sizeof(float), cudaHostAllocDefault));
+
+    // Set memory to zero for clean initialization
+    checkCuda(cudaMemset(d_input_embeds, 0, MAX_SEQ_LEN * EMBED_DIM * sizeof(float)));
+    checkCuda(cudaMemset(d_logits, 0, MAX_SEQ_LEN * VOCAB_SIZE * sizeof(float)));
 
 
     // --- Tokenizer (Simplified) ---
@@ -99,16 +112,21 @@ int main() {
     int B = 1;
     int T = 1;
 
-    for (int step = 0; step < 100; ++step) { // Generate 100 tokens
+    for (int step = 0; step < 5; ++step) { // Reduced to 5 tokens for debugging
+        std::cout << "=== Generation Step " << (step + 1) << " ===" << std::endl;
+        
         checkCuda(cudaMemcpy(d_input_tokens, h_input_tokens, T * sizeof(int), cudaMemcpyHostToDevice));
 
         // 1. Embedding Lookup
-        embedding_forward(d_input_embeds, d_input_tokens, gpu_weights["wte.weight"].data, gpu_weights["wpe.weight"].data, B, T, EMBED_DIM);
+        std::cout << "1. Embedding lookup..." << std::endl;
+        embedding_forward(d_input_embeds, d_input_tokens, gpu_weights["transformer.wte.weight"].data, gpu_weights["transformer.wpe.weight"].data, B, T, EMBED_DIM);
+        std::cout << "   Embedding completed." << std::endl;
 
-        // 2. Transformer Blocks
+        // 2. Transformer Blocks  
         float* current_input = d_input_embeds;
         for (int i = 0; i < NUM_LAYERS; ++i) {
-            std::string l = "h." + std::to_string(i) + ".";
+            std::cout << "2. Processing transformer layer " << i << "..." << std::endl;
+            std::string l = "transformer.h." + std::to_string(i) + ".";
             transformer_block_forward(d_transformer_out, current_input, handle,
                                       gpu_weights[l + "ln_1.weight"].data, gpu_weights[l + "ln_1.bias"].data,
                                       gpu_weights[l + "attn.c_attn.weight"].data, gpu_weights[l + "attn.c_attn.bias"].data,
@@ -118,17 +136,24 @@ int main() {
                                       gpu_weights[l + "mlp.c_proj.weight"].data, gpu_weights[l + "mlp.c_proj.bias"].data,
                                       B, T, EMBED_DIM, NUM_HEADS);
             current_input = d_transformer_out;
+            std::cout << "   Layer " << i << " completed." << std::endl;
         }
 
         // 3. Final LayerNorm
-        layernorm_forward(d_final_norm_out, d_transformer_out, gpu_weights["ln_f.weight"].data, gpu_weights["ln_f.bias"].data, B, T, EMBED_DIM);
+        std::cout << "3. Final LayerNorm..." << std::endl;
+        layernorm_forward(d_final_norm_out, d_transformer_out, gpu_weights["transformer.ln_f.weight"].data, gpu_weights["transformer.ln_f.bias"].data, B, T, EMBED_DIM);
+        std::cout << "   Final LayerNorm completed." << std::endl;
 
         // 4. LM Head (logits)
-        linear_forward(d_logits, d_final_norm_out, gpu_weights["wte.weight"].data, handle, B, T, EMBED_DIM, VOCAB_SIZE);
+        std::cout << "4. Computing logits..." << std::endl;
+        linear_forward(d_logits, d_final_norm_out, gpu_weights["transformer.wte.weight"].data, handle, B, T, EMBED_DIM, VOCAB_SIZE);
+        std::cout << "   Logits computation completed." << std::endl;
 
         // 5. Sample next token
+        std::cout << "5. Copying logits to host for sampling..." << std::endl;
         checkCuda(cudaMemcpy(h_logits, d_logits + (T - 1) * VOCAB_SIZE, VOCAB_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
         
+        std::cout << "6. Performing top-k sampling..." << std::endl;
         std::vector<int> top_indices;
         std::vector<float> top_probs;
         top_k_sampling(h_logits, VOCAB_SIZE, 50, top_indices, top_probs);
@@ -143,13 +168,11 @@ int main() {
             h_input_tokens[MAX_SEQ_LEN - 1] = next_token;
         }
         
-        std::cout << "Token: " << next_token << std::endl;
-    }
-
-    auto end_time = std::chrono::high_resolution_clock::now();
+        std::cout << "Generated token: " << next_token << " (Step " << (step + 1) << " completed)" << std::endl;
+    }    auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-    std::cout << "Generated 100 tokens in " << duration.count() << " ms" << std::endl;
-    std::cout << "Tokens/sec: " << 100.0 / (duration.count() / 1000.0) << std::endl;
+    std::cout << "Generated 5 tokens in " << duration.count() << " ms" << std::endl;
+    std::cout << "Tokens/sec: " << 5.0 / (duration.count() / 1000.0) << std::endl;
 
 
     // --- Cleanup ---

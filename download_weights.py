@@ -16,8 +16,10 @@ def download_and_convert_gpt2_small():
     weights = {}
     for name, param in model.named_parameters():
         weights[name] = param.detach().numpy()
+        print(f"Weight: {name}, Shape: {param.shape}")
 
     # Save the weights to a binary file
+    print("\nSaving weights to binary file...")
     with open("gpt2_small_weights.bin", "wb") as f:
         for name, arr in weights.items():
             # Write the name of the tensor

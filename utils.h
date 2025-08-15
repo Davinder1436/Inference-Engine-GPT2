@@ -45,8 +45,7 @@ std::map<std::string, Tensor> load_weights(const std::string& path) {
         t.data = new float[t.size];
         infile.read(reinterpret_cast<char*>(t.data), t.size * sizeof(float));
         
-        // Skip the newline character after the binary data
-        infile.ignore(1);
+        // No need to skip newline after binary data
 
         weights[name] = t;
     }

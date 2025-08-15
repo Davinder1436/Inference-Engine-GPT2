@@ -1,0 +1,86 @@
+#!/bin/bash
+#PBS -N gpt2_test
+#PBS -l select=1:ncpus=8:mem=16gb
+#PBS -l walltime=00:30:00
+#PBS -j oe
+#PBS -o output_$PBS_JOBID.log
+
+# Go to the directory from which qsub was run
+cd $PBS_O_WORKDIR
+
+# === Create logs directory ===
+mkdir -p ./logs
+
+# === Setup live logging ===
+LOG_FILE="./logs/${PBS_JOBID}.log"
+ERROR_FILE="./logs/${PBS_JOBID}_error.log"
+exec > >(tee -a "$LOG_FILE")
+exec 2> >(tee -a "$ERROR_FILE" >&2)
+
+echo "=== Job Started at $(date) ==="
+echo "Job ID: $PBS_JOBID"
+echo "Working Directory: $PWD"
+echo "Node: $(hostname)"
+
+# === MIG SETUP (Required) ===
+echo "=== MIG Setup ==="
+# Use specific MIG device - modify this based on your cluster's available MIG devices
+export CUDA_VISIBLE_DEVICES=MIG-4deb4e3f-78a4-599a-8d06-8095658c51e8
+echo "CUDA_VISIBLE_DEVICES set to: $CUDA_VISIBLE_DEVICES"
+
+# === GPU Information ===
+echo "=== GPU Information ==="
+nvidia-smi -L
+nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free --format=csv
+echo ""
+
+# === CUDA Environment Check ===
+echo "=== CUDA Environment ==="
+which nvcc
+nvcc --version
+echo ""
+
+# === Build test program ===
+echo "=== Building Test Program ==="
+make clean
+make test
+if [ $? -ne 0 ]; then
+    echo "ERROR: Test compilation failed!"
+    exit 1
+fi
+echo "Test program built successfully."
+echo ""
+
+# === Check weights file ===
+echo "=== Checking Model Weights ==="
+if [ ! -f "./gpt2_small_weights.bin" ]; then
+    echo "ERROR: Model weights file not found!"
+    echo "Please ensure gpt2_small_weights.bin is in the current directory."
+    exit 1
+fi
+echo "Model weights file found."
+echo ""
+
+# === Run the test program ===
+echo "=== Starting GPT-2 Test Program at $(date) ==="
+echo "Running: ./test_inference"
+echo "=================================================="
+
+# Run the test program and capture its exit code
+./test_inference
+EXIT_CODE=$?
+
+echo "=================================================="
+echo "=== Test Program Completed at $(date) with exit code: $EXIT_CODE ==="
+
+# === GPU Memory Check After Run ===
+echo "=== Final GPU Status ==="
+nvidia-smi --query-gpu=memory.used,memory.free --format=csv
+echo ""
+
+echo "=== Job Finished at $(date) ==="
+echo "Logs saved to:"
+echo "  Output: $LOG_FILE"
+echo "  Errors: $ERROR_FILE"
+
+exit $EXIT_CODE
